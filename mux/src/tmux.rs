@@ -27,8 +27,13 @@ pub enum AttachState {
 enum State {
     WaitForInitialGuard,
     Idle,
-    WaitingForResponse,
     Exit,
+}
+
+struct InFlightCommand {
+    command: Box<dyn TmuxCommand>,
+    responses_remaining: usize,
+    first_error: Option<Guarded>,
 }
 
 #[allow(dead_code)]
@@ -68,6 +73,7 @@ pub(crate) struct TmuxDomainState {
     pub domain_id: DomainId, // ID of TmuxDomain
     state: Mutex<State>,
     pub cmd_queue: Arc<Mutex<TmuxCmdQueue>>,
+    in_flight: Mutex<VecDeque<InFlightCommand>>,
     pub gui_window: Mutex<Option<MuxWindowBuilder>>,
     pub gui_tabs: Mutex<HashMap<TmuxWindowId, TmuxTab>>,
     pub remote_panes: Mutex<HashMap<TmuxPaneId, RefTmuxRemotePane>>,
@@ -93,21 +99,37 @@ impl TmuxDomainState {
                     State::WaitForInitialGuard => {
                         *self.state.lock() = State::Idle;
                     }
-                    State::WaitingForResponse => {
-                        let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                        if let Some(cmd) = cmd_queue.pop_front() {
+                    State::Idle => {
+                        // Server-originated commands, such as hooks, use flags=0 and must not
+                        // consume a response expected by a command that we sent.
+                        if response.flags & 1 == 0 {
+                            continue;
+                        }
+
+                        let mut in_flight = self.in_flight.lock();
+                        if let Some(first) = in_flight.front_mut() {
+                            if response.error && first.first_error.is_none() {
+                                first.first_error = Some(response.clone());
+                            }
+                            first.responses_remaining -= 1;
+                            if first.responses_remaining != 0 {
+                                continue;
+                            }
+
+                            let cmd = in_flight.pop_front().unwrap();
+                            let command = cmd.command;
                             let domain_id = self.domain_id;
-                            *self.state.lock() = State::Idle;
-                            let resp = response.clone();
+                            let resp = cmd.first_error.unwrap_or_else(|| response.clone());
                             promise::spawn::spawn_into_main_thread(async move {
-                                if let Err(err) = cmd.process_result(domain_id, &resp) {
+                                if let Err(err) = command.process_result(domain_id, &resp) {
                                     log::error!("Tmux processing command result error: {}", err);
                                 }
                             })
                             .detach();
+                        } else {
+                            log::warn!("unexpected tmux command response: {response:?}");
                         }
                     }
-                    State::Idle => {}
                     State::Exit => {}
                 },
 
@@ -128,6 +150,7 @@ impl TmuxDomainState {
                     }
                     let mut cmd_queue = self.cmd_queue.as_ref().lock();
                     cmd_queue.clear();
+                    self.in_flight.lock().clear();
 
                     // Force to quit the tmux mode
                     let pane_id = self.pane_id;
@@ -234,7 +257,7 @@ impl TmuxDomainState {
         }
     }
 
-    /// send next command at the front of cmd_queue.
+    /// send pending commands in cmd_queue.
     /// must be called inside main thread
     fn send_next_command(&self) {
         if *self.state.lock() != State::Idle {
@@ -247,14 +270,18 @@ impl TmuxDomainState {
                 cmd_queue.pop_front();
                 continue;
             }
+            let command = cmd_queue.pop_front().unwrap();
+            self.in_flight.lock().push_back(InFlightCommand {
+                command,
+                responses_remaining: cmd.lines().count(),
+                first_error: None,
+            });
             log::debug!("sending cmd {:?}", cmd);
             let mux = Mux::get();
             if let Some(pane) = mux.get_pane(self.pane_id) {
                 let mut writer = pane.writer();
                 let _ = write!(writer, "{}", cmd);
             }
-            *self.state.lock() = State::WaitingForResponse;
-            break;
         }
     }
 
@@ -342,6 +369,7 @@ impl TmuxDomain {
             // parser,
             state: Mutex::new(State::WaitForInitialGuard),
             cmd_queue: Arc::new(Mutex::new(cmd_queue)),
+            in_flight: Mutex::new(VecDeque::new()),
             gui_window: Mutex::new(None),
             gui_tabs: Mutex::new(HashMap::default()),
             remote_panes: Mutex::new(HashMap::default()),
